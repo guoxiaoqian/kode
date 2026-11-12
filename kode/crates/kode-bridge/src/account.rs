@@ -136,6 +136,11 @@ pub struct PendingSignIn {
 #[derive(Clone)]
 pub struct AccountClient {
     http: reqwest::Client,
+    /// Stable id of this installation, sent as `x-device-id` on every
+    /// sign-in and refresh (as the CloudBase SDK does). When all sign-ins
+    /// shared one id, each new one revoked the previous session's refresh
+    /// token, so two installs must never share an id.
+    device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,11 +161,23 @@ impl Default for AccountClient {
                 .timeout(Duration::from_secs(15))
                 .build()
                 .expect("account HTTP client"),
+            device_id: None,
         }
     }
 }
 
 impl AccountClient {
+    pub fn for_device(device_id: String) -> Self {
+        Self { device_id: Some(device_id), ..Self::default() }
+    }
+
+    fn with_device(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.device_id {
+            Some(id) => request.header("x-device-id", id),
+            None => request,
+        }
+    }
+
     async fn health(&self, server_url: &str) -> Result<Value, String> {
         let health: Value = self
             .http
@@ -263,9 +280,10 @@ impl AccountClient {
             name: String::new(),
             picture: String::new(),
             user_id,
-            access_token: tokens.access_token,
+            access_token: tokens.access_token.clone(),
             refresh_token,
-            expires_at: now_ms + tokens.expires_in * 1000,
+            expires_at: jwt_expires_at_ms(&tokens.access_token)
+                .unwrap_or_else(|| now_ms + tokens.expires_in * 1000),
         };
         Ok(self.with_profile(session).await)
     }
@@ -286,11 +304,12 @@ impl AccountClient {
         // Picks up a name or avatar set from another device.
         Ok(self
             .with_profile(AccountSession {
-                access_token: tokens.access_token,
+                access_token: tokens.access_token.clone(),
                 refresh_token: tokens
                     .refresh_token
                     .unwrap_or_else(|| session.refresh_token.clone()),
-                expires_at: now_ms + tokens.expires_in * 1000,
+                expires_at: jwt_expires_at_ms(&tokens.access_token)
+                    .unwrap_or_else(|| now_ms + tokens.expires_in * 1000),
                 ..session.clone()
             })
             .await)
@@ -385,9 +404,10 @@ impl AccountClient {
                 Some(sub) => sub,
                 None => jwt_subject(&tokens.access_token).ok_or("access token has no subject")?,
             },
-            access_token: tokens.access_token,
+            access_token: tokens.access_token.clone(),
             refresh_token: tokens.refresh_token.ok_or("the relay returned no refresh token")?,
-            expires_at: now_ms + tokens.expires_in * 1000,
+            expires_at: jwt_expires_at_ms(&tokens.access_token)
+                .unwrap_or_else(|| now_ms + tokens.expires_in * 1000),
         };
         Ok(self.with_profile(session).await)
     }
@@ -396,8 +416,7 @@ impl AccountClient {
     /// Best effort: an unreachable profile keeps what the session had.
     pub async fn with_profile(&self, session: AccountSession) -> AccountSession {
         let profile: Option<Value> = async {
-            self.http
-                .get(format!("{}/auth/v1/user/me", session.issuer))
+            self.with_device(self.http.get(format!("{}/auth/v1/user/me", session.issuer)))
                 .bearer_auth(&session.access_token)
                 .send()
                 .await
@@ -462,9 +481,10 @@ impl AccountClient {
                 Some(sub) => sub,
                 None => jwt_subject(&tokens.access_token).ok_or("access token has no subject")?,
             },
-            access_token: tokens.access_token,
+            access_token: tokens.access_token.clone(),
             refresh_token: tokens.refresh_token.ok_or("the relay returned no refresh token")?,
-            expires_at: now_ms + tokens.expires_in * 1000,
+            expires_at: jwt_expires_at_ms(&tokens.access_token)
+                .unwrap_or_else(|| now_ms + tokens.expires_in * 1000),
         };
         Ok(self.with_profile(session).await)
     }
@@ -525,9 +545,10 @@ impl AccountClient {
                 Some(sub) => sub,
                 None => jwt_subject(&tokens.access_token).ok_or("access token has no subject")?,
             },
-            access_token: tokens.access_token,
+            access_token: tokens.access_token.clone(),
             refresh_token: tokens.refresh_token.ok_or("the relay returned no refresh token")?,
-            expires_at: now_ms + tokens.expires_in * 1000,
+            expires_at: jwt_expires_at_ms(&tokens.access_token)
+                .unwrap_or_else(|| now_ms + tokens.expires_in * 1000),
         };
         Ok(Some(self.with_profile(session).await))
     }
@@ -578,7 +599,7 @@ impl AccountClient {
         access_token: Option<&str>,
         body: Option<Value>,
     ) -> Result<Value, String> {
-        let mut request = self.http.request(method, format!("{server_url}{path}"));
+        let mut request = self.with_device(self.http.request(method, format!("{server_url}{path}")));
         if let Some(token) = access_token {
             request = request.bearer_auth(token);
         }
@@ -624,8 +645,7 @@ impl AccountClient {
 
     async fn post(&self, issuer: &str, path: &str, body: Value) -> Result<Value, String> {
         let response = self
-            .http
-            .post(format!("{issuer}{path}"))
+            .with_device(self.http.post(format!("{issuer}{path}")))
             .json(&body)
             .send()
             .await
@@ -729,6 +749,17 @@ fn jwt_subject(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extracts the `exp` claim from a JWT and returns it as epoch milliseconds.
+/// Returns None if the token is malformed or has no `exp` claim.
+fn jwt_expires_at_ms(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let exp_seconds = serde_json::from_slice::<Value>(&bytes).ok()?["exp"].as_u64()?;
+    Some(exp_seconds * 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,6 +858,18 @@ mod tests {
             .encode(br#"{"sub":"user-42","exp":1}"#);
         assert_eq!(jwt_subject(&format!("h.{payload}.s")).as_deref(), Some("user-42"));
         assert_eq!(jwt_subject("garbage"), None);
+    }
+
+    #[test]
+    fn reads_expiry_from_jwt_payload() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"user-42","exp":1794372658}"#);
+        let token = format!("h.{payload}.s");
+        assert_eq!(jwt_expires_at_ms(&token), Some(1794372658000));
+        assert_eq!(jwt_expires_at_ms("garbage"), None);
+        let no_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"user-42"}"#);
+        assert_eq!(jwt_expires_at_ms(&format!("h.{no_exp}.s")), None);
     }
 
     #[test]
